@@ -1,6 +1,7 @@
 import http.client
 import logging
 import os
+import threading
 import time
 import xmlrpc.client
 from typing import Any
@@ -109,6 +110,15 @@ class FreeCADConnection:
                 connect_grace = _CONNECT_GRACE_DEFAULT
         self._connect_grace = float(connect_grace)
         self.server = self._make_proxy(timeout)
+        # One request on the wire at a time. The proxy reuses a single keep-alive
+        # HTTP connection, and http.client connections are not thread-safe: the MCP
+        # server runs each tool call in its own worker thread, so parallel tool
+        # calls from one agent turn collided on that connection (CannotSendRequest /
+        # ResponseNotReady "Idle", WinError 10038) and failed. The addon's XML-RPC
+        # server is single-threaded and runs everything on FreeCAD's GUI thread, so
+        # serialising here costs no throughput: parallel calls now queue and succeed.
+        # Reentrant because a call's recovery path may issue another RPC.
+        self._rpc_lock = threading.RLock()
 
     def _make_proxy(self, timeout: float) -> xmlrpc.client.ServerProxy:
         return xmlrpc.client.ServerProxy(
@@ -151,11 +161,24 @@ class FreeCADConnection:
                 time.sleep(_CONNECT_RETRY_DELAY)
 
     def _invoke_once(self, method: str, *args):
+        with self._rpc_lock:
+            return self._invoke_locked(method, *args)
+
+    def _invoke_locked(self, method: str, *args):
         try:
             return getattr(self.server, method)(*args)
         except ConnectionRefusedError:
             # Nothing was sent — the grace window in _invoke owns this case.
             raise
+        except http.client.CannotSendRequest as e:
+            # The connection was in the wrong state to SEND, so this request never
+            # left: retrying on a fresh proxy cannot double-apply anything, for
+            # reads and mutations alike. (Under the lock this should not happen;
+            # it is kept so a stray state error never reads as "MAY have been
+            # applied" and sends the agent off to inspect a document for nothing.)
+            logger.warning(f"RPC '{method}': request could not be sent ({e!r}); reconnecting and retrying once")
+            self.server = self._make_proxy(self._timeout)
+            return getattr(self.server, method)(*args)
         except _RECOVERABLE_ERRORS as e:
             if method not in _RETRYABLE_METHODS:
                 raise RuntimeError(
@@ -222,10 +245,12 @@ class FreeCADConnection:
 
     def disconnect(self) -> None:
         # Transport.close() clears cached HTTP connections if one was opened.
-        transport = getattr(self.server, "_ServerProxy__transport", None)
-        close = getattr(transport, "close", None)
-        if callable(close):
-            close()
+        # Under the lock, so it never closes the connection under a call in flight.
+        with self._rpc_lock:
+            transport = getattr(self.server, "_ServerProxy__transport", None)
+            close = getattr(transport, "close", None)
+            if callable(close):
+                close()
 
     def ping(self) -> bool:
         return self._invoke("ping")
