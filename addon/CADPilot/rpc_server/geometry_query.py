@@ -331,6 +331,23 @@ def get_topology(doc_name, obj_name, element="faces", limit=50, offset=0):
 # ---------------------------------------------------------------------------
 
 
+# common volume (mm^3) above which two shapes intersect rather than touch
+_INTERFERENCE_EPS = 1e-4
+
+
+def _padded_bbox(shape):
+    """BoundBox enlarged by 0.25 mm for a cheap "can these touch at all" prefilter.
+
+    Same rule as ``assembly_ops._audit_bbox``: OCC builds the box from control
+    points and can UNDER-report a curved shape (a tube-radius-8 torus reads
+    z +-7.94), so an unpadded box would skip pairs that really touch.
+    """
+    bb = shape.BoundBox
+    with contextlib.suppress(Exception):
+        bb.enlarge(0.25)
+    return bb
+
+
 def check_interference(doc_name, obj_a, obj_b):
     shape_a, err = _get_shape(doc_name, obj_a)
     if err:
@@ -339,12 +356,20 @@ def check_interference(doc_name, obj_a, obj_b):
     if err:
         return {"success": False, "error": err}
     try:
-        distance = shape_a.distToShape(shape_b)[0]
-        common_volume = shape_a.common(shape_b).Volume
+        # Intersection first: an overlap already fixes the distance at 0, and
+        # distToShape on OVERLAPPING B-reps is pathologically slow (live: 295 s
+        # for a 2,662-face camera body vs a 688-face clamp, past the 150 s RPC
+        # timeout, while common() took 0.9 s). Boxes that cannot touch skip the
+        # boolean entirely; distToShape still decides every non-overlapping pair.
+        if _padded_bbox(shape_a).intersect(_padded_bbox(shape_b)):
+            common_volume = shape_a.common(shape_b).Volume
+        else:
+            common_volume = 0.0
+        distance = 0.0 if common_volume > _INTERFERENCE_EPS else shape_a.distToShape(shape_b)[0]
         return {
             "success": True,
             "distance_mm": _r(distance),
-            "intersects": bool(common_volume > 1e-4),
+            "intersects": bool(common_volume > _INTERFERENCE_EPS),
             "common_volume_mm3": _r(common_volume),
         }
     except Exception as e:

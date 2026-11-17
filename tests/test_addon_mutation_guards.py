@@ -419,3 +419,26 @@ def test_edit_object_reaches_dynamic_spreadsheet_cells_and_explains_placement():
     # One setter, two callers: the variables op must not keep a second copy.
     assert "set_spreadsheet_cells" in _names(_func(FEATURE, "_build_variables"))
     assert "bool is not a valid value" not in ast.unparse(_func(FEATURE, "_build_variables"))
+
+
+def test_check_interference_intersects_before_measuring_distance():
+    """distToShape on OVERLAPPING B-reps is pathologically slow (live: 295 s for a
+    2,662-face camera body vs a 688-face clamp, past the 150 s RPC timeout, while
+    common() took 0.9 s). The boolean must run first, and distance is measured only
+    on the no-overlap branch; the bbox prefilter must use the padded box."""
+    fn = _func(GEOMETRY, "check_interference")
+    calls = [
+        n for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+    ]
+    common = [n for n in calls if n.func.attr == "common"]
+    dist = [n for n in calls if n.func.attr == "distToShape"]
+    assert common and dist
+    assert min(n.lineno for n in common) < min(n.lineno for n in dist), "common() must run first"
+    in_else = set()
+    for n in ast.walk(fn):
+        branch = (
+            n.orelse if isinstance(n, ast.If) else [n.orelse] if isinstance(n, ast.IfExp) else []
+        )
+        in_else |= {id(m) for s in branch for m in ast.walk(s)}
+    assert all(id(n) in in_else for n in dist), "distToShape only when the shapes do not overlap"
+    assert "_padded_bbox" in _names(fn), "unpadded BoundBox under-reports curved shapes"
